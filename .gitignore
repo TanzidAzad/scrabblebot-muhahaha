@@ -10,3 +10,7 @@ target/
 bot-starter/src/module_bindings/
 .vercel
 .env*
+
+# bot run output and raw downloads (matches.json is kept for npm run replay)
+bot-starter/bot.log
+bot-starter/replay/*.txt

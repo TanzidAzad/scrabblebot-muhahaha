@@ -27,7 +27,7 @@ import {
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { chooseWord, decideBid } from "./strategy.js";
+import { decideBid, planWords, warmUp, MARKET_PRICE } from "./strategy.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -64,12 +64,13 @@ const DICTIONARY: string[] = fs.existsSync(dictionaryPath)
       .filter((l) => l.length >= 2)
   : [];
 DICTIONARY.sort((a, b) => b.length - a.length); // longest first for greedy pick
+warmUp(DICTIONARY);
 
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
 const bidsByAuction = new Set<string>();
 const lastWordAttemptByMatch = new Map<string, number>();
-const WORD_RETRY_MS = 500;
+const WORD_RETRY_MS = 300;
 
 function resolveMyBotId(conn: DbConnection): bigint | null {
   if (!myIdentity) return null;
@@ -113,6 +114,27 @@ function logFailure(what: string) {
     );
 }
 
+// How expensive letters are right now vs typical, from the last 40 sales
+// in our own matches (median of price paid / typical price).
+function marketScale(conn: DbConnection): number {
+  const ratios: number[] = [];
+  const rows = Array.from(conn.db.auctionResult.iter())
+    .filter((r) => r.winnerBotId !== undefined && r.winnerBotId !== null)
+    .sort((a, b) => (a.auctionId < b.auctionId ? 1 : -1))
+    .slice(0, 40);
+  for (const r of rows) {
+    const typical = MARKET_PRICE[r.letter];
+    if (typical) ratios.push(Number(r.paid) / typical);
+  }
+  if (ratios.length < 8) return 1;
+  ratios.sort((a, b) => a - b);
+  return ratios[Math.floor(ratios.length / 2)];
+}
+
+// Words we've just sent, so we don't send the same one twice before the
+// server's reply arrives.
+const recentWords = new Map<string, number>();
+
 function tryBid(
   conn: DbConnection,
   auctionId: bigint,
@@ -124,10 +146,18 @@ function tryBid(
   if (bidsByAuction.has(key)) return;
   const participant = participantForMatch(conn, matchId);
   if (!participant) return;
+  const m = conn.db.matchState.id.find(matchId);
+  const players = Array.from(conn.db.matchParticipant.iter()).filter(
+    (p) => p.matchId === matchId,
+  ).length;
   const amount = decideBid({
     letter,
     myBalance: participant.balance,
     myRack: rackForMatch(conn, matchId),
+    bagTotal: m ? Number(m.bagTotal) : undefined,
+    players: players || undefined,
+    dictionary: DICTIONARY,
+    marketScale: marketScale(conn),
   });
   if (amount <= 0) return;
   conn.reducers
@@ -154,15 +184,22 @@ function tryPlayWord(conn: DbConnection) {
     const key = String(matchId);
     if (now - (lastWordAttemptByMatch.get(key) ?? 0) < WORD_RETRY_MS) continue;
     lastWordAttemptByMatch.set(key, now);
-    const word = chooseWord({
+    const m = conn.db.matchState.id.find(matchId);
+    const words = planWords({
       myRack: rackForMatch(conn, matchId),
       dictionary: DICTIONARY,
+      bagTotal: m ? Number(m.bagTotal) : undefined,
+      myBalance: participantForMatch(conn, matchId)?.balance,
     });
-    if (!word) continue;
-    console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
-    conn.reducers
-      .submitWord({ matchId, word })
-      .catch(logFailure(`playing '${word}'`));
+    for (const word of words) {
+      const wkey = `${matchId}:${word}`;
+      if (now - (recentWords.get(wkey) ?? 0) < 2000) continue;
+      recentWords.set(wkey, now);
+      console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
+      conn.reducers
+        .submitWord({ matchId, word })
+        .catch(logFailure(`playing '${word}'`));
+    }
   }
 }
 
@@ -197,7 +234,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
             console.log(
               `[${BOT_NAME}] claimed credential for bot '${bot?.name ?? "?"}' (id ${myBotId})`,
             );
-            bootstrapActivity(conn);
+            subscribeMine(conn);
           }, 1000);
           return;
         } else {
@@ -212,15 +249,19 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       console.log(
         `[${BOT_NAME}] acting as bot '${bot?.name ?? "?"}' (id ${myBotId})`,
       );
-      bootstrapActivity(conn);
+      subscribeMine(conn);
     })
-    .subscribeToAllTables();
+    // Only the small tables first. The server holds millions of rows of
+    // old matches; subscribing to everything runs out of memory.
+    .subscribe(["SELECT * FROM bot_credential", "SELECT * FROM bot"]);
 
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
     if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
   });
   conn.db.myRack.onInsert(() => tryPlayWord(conn));
   conn.db.myRack.onUpdate(() => tryPlayWord(conn));
+  // Each new round shrinks the bag; re-check so we cash in before the end.
+  conn.db.matchState.onUpdate(() => tryPlayWord(conn));
   conn.db.botCredential.onInsert(() => {
     if (myBotId === null) myBotId = resolveMyBotId(conn);
   });
@@ -271,6 +312,31 @@ function joinLobby(conn: DbConnection) {
   conn.reducers.joinLobby({}).catch(logFailure("joining the lobby"));
 }
 
+// Once we know our bot id, subscribe only to rows about our own matches.
+function subscribeMine(conn: DbConnection) {
+  const me = String(myBotId);
+  const mine = `JOIN match_participant p ON x.match_id = p.match_id WHERE p.bot_id = ${me}`;
+  conn
+    .subscriptionBuilder()
+    .onApplied(() => {
+      console.log(`[${BOT_NAME}] match data subscribed`);
+      bootstrapActivity(conn);
+    })
+    .onError((ctx: ErrorContext) =>
+      console.error(`[${BOT_NAME}] subscription error:`, (ctx as any).event ?? ctx),
+    )
+    .subscribe([
+      "SELECT * FROM my_rack",
+      `SELECT * FROM match_participant WHERE bot_id = ${me}`,
+      `SELECT x.* FROM match_participant x ${mine}`,
+      `SELECT x.* FROM match_state x JOIN match_participant p ON x.id = p.match_id WHERE p.bot_id = ${me}`,
+      `SELECT x.* FROM auction x ${mine}`,
+      `SELECT x.* FROM auction_result x ${mine}`,
+      `SELECT x.* FROM lobby x JOIN lobby_member lm ON x.id = lm.lobby_id WHERE lm.bot_id = ${me}`,
+      `SELECT * FROM lobby_member WHERE bot_id = ${me}`,
+    ]);
+}
+
 function bootstrapActivity(conn: DbConnection) {
   if (TOURNAMENT_ID) {
     conn.reducers
@@ -297,7 +363,11 @@ function main() {
     .onConnectError((_ctx: ErrorContext, err: Error) =>
       console.error("connect error:", err.message),
     )
-    .onDisconnect(() => console.log("disconnected"))
+    .onDisconnect(() => {
+      // The server sometimes drops the connection. Exit so run.sh restarts us.
+      console.log("disconnected; restarting in 3s");
+      setTimeout(() => process.exit(1), 3000);
+    })
     .build();
 }
 
